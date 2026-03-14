@@ -28,6 +28,7 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -138,9 +139,14 @@ class ContextRequest(BaseModel):
     token:         str = Field(..., description="Google OAuth2 access token")
     body:          str = Field(..., description="Current email body to analyse")
     subject:       Optional[str] = Field(None, description="Email subject (optional, improves quality)")
+    timezone:      str = Field("UTC", description="User timezone, e.g. 'America/New_York'")
 
 class ContextScore(BaseModel):
     description: str
+
+class MentionedDate(BaseModel):
+    raw: str
+    iso: str
 
 class ContextResponse(BaseModel):
     relationship_context: ContextScore
@@ -151,6 +157,9 @@ class ContextResponse(BaseModel):
     vectors_upserted:     int
     user_namespace:       str
     sender_email:         str
+    keywords:             list[str] = Field(default_factory=list)
+    mentionedDates:       list[MentionedDate] = Field(default_factory=list)
+    intent:               str = Field(default="general")
 
 # ---------------------------------------------------------------------------
 # Helper utilities
@@ -391,34 +400,41 @@ def _classify_type(subject: str, body: str) -> str:
 
 import json
 
-def _generate_llm_context(body_text: str, matches: list[dict], global_matches: list[dict]) -> dict:
-    """Uses gpt-5-nano to generate drafter-focused context for the user."""
-    if not matches and not global_matches:
-        return {
-            "relationship": "No prior relationship history found.",
-            "topic": "No prior topic history found to inform this reply.",
-            "behavioural": "Acknowledge the email professionally and respond to their specific questions."
-        }
+def _generate_llm_context(body_text: str, subject: str, matches: list[dict], global_matches: list[dict], timezone_str: str) -> dict:
+    """Uses gpt-5-nano to generate drafter-focused context and extract entities for the user."""
+    
+    try:
+        local_time = datetime.now(ZoneInfo(timezone_str))
+    except Exception:
+        local_time = datetime.now(timezone.utc)
+        timezone_str = "UTC"
+        
+    today_str = local_time.strftime("%Y-%m-%d")
+    day_of_week_str = local_time.strftime("%A")
 
     # History from THIS specific sender
     sender_history = "\n---\n".join([
         f"Snippet: {m.get('metadata', {}).get('body_snippet', '')[:200]}"
-        for m in matches[:3]
+        for m in (matches[:3] if matches else [])
     ])
 
     # History across ALL senders (to catch cross-conversations, e.g. talking to a manager)
     global_history = "\n---\n".join([
         f"Sender: {m.get('metadata', {}).get('sender', 'Unknown')}\nSnippet: {m.get('metadata', {}).get('body_snippet', '')[:200]}"
-        for m in global_matches[:5]
+        for m in (global_matches[:5] if global_matches else [])
     ])
 
     prompt = f"""
 You are an intelligent email drafting assistant. The user has received a new email.
-Your job is to analyze the new email against two types of retrieved history:
+Your job is to analyze the new email against two types of retrieved history (if any):
 1. Past emails with THIS specific sender.
 2. Past emails with ANY sender (global history), which might contain critical behind-the-scenes context (e.g. the user told a manager a project is delayed).
+Additionally, extract structured information from the new email.
 
-New Email:
+Today is {today_str} ({day_of_week_str}), timezone {timezone_str}.
+
+New Email Subject: {subject}
+New Email Body:
 {body_text[:800]}
 
 --- Past Emails with THIS Sender ---
@@ -427,13 +443,22 @@ New Email:
 --- Relevant Global History (Other Senders) ---
 {global_history if global_history else "None found."}
 
-Provide a very short plain-English summary (1-2 sentences each) for the following three dimensions:
-Output EXACTLY valid JSON with keys: "relationship", "topic", "behavioural".
+Provide a very short plain-English summary (1-2 sentences each) for the relationship, topic, and behavioural dimensions.
+Output EXACTLY valid JSON with these keys: "relationship", "topic", "behavioural", "intent", "keywords", "mentionedDates".
 
 Dimensions constraints:
-- "relationship": How formal or informal is the user's past interaction with this specific sender? 
-- "topic": What are the background facts based on the global history? For instance, if the new email asks for a deliverable but global history says it is delayed, state that clearly ("You recently informed your manager that the project is not ready...").
-- "behavioural": Explicit drafting advice for how the user should reply right now, considering both the relationship and the factual constraints.
+- "relationship": How formal or informal is the user's past interaction with this specific sender? (Say "No prior relationship history found" if none)
+- "topic": What are the background facts based on the global history? For instance, if the new email asks for a deliverable but global history says it is delayed, state that clearly. (Say "No prior topic history found" if none)
+- "behavioural": Explicit drafting advice for how the user should reply right now, considering both the relationship and the factual constraints. (If no history, give general professional advice based on the email content)
+- "intent": "scheduling_request|task_assignment|question|follow_up|general"
+- "keywords": ["max 3 topic keywords based on the new email"]
+- "mentionedDates": [{{"raw": "Wednesday at 5pm", "iso": "2026-03-18T17:00:00+05:30"}}]
+
+IMPORTANT for dates:
+All ISO dates must include the timezone offset for {timezone_str}. Never use bare local time without an offset.
+If someone says "this Friday" and today IS Friday, "this Friday" means TODAY ({today_str}), not next week.
+If someone says "next Friday", that means the Friday of next week.
+Resolve all relative dates from today's date {today_str}.
 """
     try:
         resp = openai_client.chat.completions.create(
@@ -451,7 +476,10 @@ Dimensions constraints:
         return {
             "relationship": "Error generating relationship context.",
             "topic": "Error generating topic context.",
-            "behavioural": "Error generating behavioural context."
+            "behavioural": "Error generating behavioural context.",
+            "intent": "general",
+            "keywords": [],
+            "mentionedDates": []
         }
 
 
@@ -593,7 +621,13 @@ async def get_context(req: ContextRequest):
     log.info("Scoring based on %d sender matches / %d global matches for (user=%s)", len(matches), len(global_matches), req.user_id)
 
     # ── 7. Build the Drafter Context ─────────────────────────────────────
-    llm_context = _generate_llm_context(body_text, matches, global_matches)
+    llm_context = _generate_llm_context(
+        body_text=body_text,
+        subject=req.subject or "",
+        matches=matches,
+        global_matches=global_matches,
+        timezone_str=req.timezone
+    )
 
     rel_ctx, rel_score = _score_relationship(matches, desc=llm_context.get("relationship", ""))
     top_ctx, top_score = _score_topic(matches, desc=llm_context.get("topic", ""))
@@ -637,6 +671,9 @@ async def get_context(req: ContextRequest):
         vectors_upserted=vectors_upserted,
         user_namespace=namespace,
         sender_email=req.sender_email,
+        keywords=llm_context.get("keywords", []),
+        mentionedDates=llm_context.get("mentionedDates", []),
+        intent=llm_context.get("intent", "general"),
     )
 
 
