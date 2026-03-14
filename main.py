@@ -1,0 +1,657 @@
+"""
+NeatMail Context Engine
+-----------------------
+FastAPI/Uvicorn service that retrieves semantic email context from Pinecone
+(relationship, topic, behavioural) vs. an incoming email body.
+
+Flow:
+  1. Receive  user_id, sender_domain, token (Google OAuth), body
+  2. Query Pinecone (metadata filter: user_id + sender_domain) for vector count
+  3. If cold → fetch last 3 months of emails from that sender via Gmail search,
+     embed + upsert all of them
+  4. Embed current body, run filtered similarity search → three context scores
+  5. Upsert current body
+  6. Return Relationship / Topic / Behavioural context + relevance signal
+
+Namespace strategy
+------------------
+  Single namespace = user_id   (one per user, NOT one per user+domain)
+  Sender domain is a metadata field → filtered via Pinecone metadata filter.
+  This keeps namespace count = number of users, not users × senders.
+"""
+
+import asyncio
+import base64
+import hashlib
+import logging
+import os
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from dotenv import load_dotenv
+load_dotenv()
+
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from pinecone import Pinecone, ServerlessSpec
+from openai import OpenAI
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("context-engine")
+
+# ---------------------------------------------------------------------------
+# Env / Config
+# ---------------------------------------------------------------------------
+OPENAI_API_KEY      = os.environ["AZURE_API_KEY"]
+OPENAI_ENDPOINT     = os.environ["AZURE_ENDPOINT"]
+PINECONE_API_KEY    = os.environ["PINECONE_API_KEY"]
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "neatmail-context")
+PINECONE_CLOUD      = os.getenv("PINECONE_CLOUD", "aws")
+PINECONE_REGION     = os.getenv("PINECONE_REGION", "us-east-1")
+
+EMBED_MODEL         = "text-embedding-3-small"
+EMBED_DIM           = 1536            # text-embedding-3-small native dimension
+
+# Minimum stored vectors for this user+sender before skipping history fetch
+MIN_VECTORS         = int(os.getenv("MIN_VECTORS", "5"))
+
+# How many neighbours to pull for each context query
+TOP_K               = int(os.getenv("TOP_K", "10"))
+
+# Relevance threshold (cosine similarity)
+RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD", "0.75"))
+
+# Maximum emails to pull from 2-month history (keeps embedding costs sane)
+HISTORY_MAX_EMAILS  = int(os.getenv("HISTORY_MAX_EMAILS", "50"))
+
+# Look-back window in days
+HISTORY_DAYS        = int(os.getenv("HISTORY_DAYS", "60"))
+
+GMAIL_API_BASE      = "https://gmail.googleapis.com/gmail/v1/users/me"
+
+# ---------------------------------------------------------------------------
+# Clients (module-level singletons)
+# ---------------------------------------------------------------------------
+openai_client = OpenAI(
+        base_url=OPENAI_ENDPOINT,
+        api_key=OPENAI_API_KEY
+    )
+
+pc = Pinecone(api_key=PINECONE_API_KEY)
+
+# Create index if it doesn't exist yet
+existing = [idx.name for idx in pc.list_indexes()]
+if PINECONE_INDEX_NAME not in existing:
+    log.info("Creating Pinecone index '%s' …", PINECONE_INDEX_NAME)
+    pc.create_index(
+        name=PINECONE_INDEX_NAME,
+        dimension=EMBED_DIM,
+        metric="cosine",
+        spec=ServerlessSpec(cloud=PINECONE_CLOUD, region=PINECONE_REGION),
+    )
+    while not pc.describe_index(PINECONE_INDEX_NAME).status["ready"]:
+        time.sleep(1)
+    log.info("Index ready.")
+
+index = pc.Index(PINECONE_INDEX_NAME)
+
+# ---------------------------------------------------------------------------
+# Warm-pair cache  (in-process; avoids an extra Pinecone RU per request)
+# ---------------------------------------------------------------------------
+# Stores "user_id::sender_domain" strings for pairs that have already been
+# initialised this process lifetime.  On restart it's empty, so the first
+# request after restart re-checks via a real query (one-time cost per pair).
+_warm_pairs: set[str] = set()    #memory usage dekhni padegi
+_warm_lock = asyncio.Lock()   # prevents duplicate cold-start on burst traffic
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+app = FastAPI(
+    title="NeatMail Context Engine",
+    description="Semantic email relationship/topic/behavioural context via Pinecone + OpenAI",
+    version="1.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+class ContextRequest(BaseModel):
+    user_id:       str = Field(..., description="Clerk / internal user ID")
+    sender_email:  str = Field(..., description="Full sender email address, e.g. 'john@github.com'")
+    token:         str = Field(..., description="Google OAuth2 access token")
+    body:          str = Field(..., description="Current email body to analyse")
+    subject:       Optional[str] = Field(None, description="Email subject (optional, improves quality)")
+
+class ContextScore(BaseModel):
+    description: str
+
+class ContextResponse(BaseModel):
+    relationship_context: ContextScore
+    topic_context:        ContextScore
+    behavioural_context:  ContextScore
+    overall_relevance:    float
+    is_relevant:          bool
+    vectors_upserted:     int
+    user_namespace:       str
+    sender_email:         str
+
+# ---------------------------------------------------------------------------
+# Helper utilities
+# ---------------------------------------------------------------------------
+
+def _user_namespace(user_id: str) -> str:
+    """
+    One Pinecone namespace per USER (not per user+domain).
+    sender_domain is stored in metadata and used as a filter on every query.
+    This prevents namespace explosion on the free tier.
+    """
+    return user_id
+
+
+def _vector_id(text: str, prefix: str = "") -> str:
+    """Deterministic SHA-1 based vector ID."""
+    digest = hashlib.sha1(text.encode()).hexdigest()[:16]
+    return f"{prefix}{digest}" if prefix else digest
+
+
+def _embed(texts: list[str]) -> list[list[float]]:
+    """
+    Embed a list of texts using text-embedding-3-small.
+    Automatically chunks into batches of 512 (OpenAI limit is 2048 but
+    keeping small to avoid timeout on free-tier).
+    """
+    if not texts:
+        return []
+    all_vectors: list[list[float]] = []
+    batch_size = 512
+    for i in range(0, len(texts), batch_size):
+        resp = openai_client.embeddings.create(
+            model=EMBED_MODEL,
+            input=texts[i:i + batch_size],
+        )
+        all_vectors.extend(item.embedding for item in resp.data)
+    return all_vectors
+
+
+def _is_warm(user_id: str, sender_email: str) -> bool:
+    """Return True if this user+sender pair is already in the warm cache."""
+    return f"{user_id}::{sender_email}" in _warm_pairs
+
+
+def _mark_warm(user_id: str, sender_email: str) -> None:
+    """Mark a user+sender pair as warm so we skip cold-start next time."""
+    _warm_pairs.add(f"{user_id}::{sender_email}")
+
+# ---------------------------------------------------------------------------
+# Gmail helpers
+# ---------------------------------------------------------------------------
+
+async def _fetch_sender_history(
+    sender_email: str,
+    token: str,
+    days: int = HISTORY_DAYS,
+    max_emails: int = HISTORY_MAX_EMAILS,
+) -> list[dict]:
+    """
+    Fetch up to `max_emails` messages from the last `days` days sent by or sent to
+    `sender_email` using Gmail search.
+    
+    Gmail query: (from:{sender_email} OR to:{sender_email}) after:{after_ts}
+    """
+    headers  = {"Authorization": f"Bearer {token}"}
+    cutoff   = datetime.now(timezone.utc) - timedelta(days=days)
+    # Gmail's after: filter uses Unix epoch (seconds)
+    after_ts = int(cutoff.timestamp())
+    query    = f"(from:{sender_email} OR to:{sender_email}) after:{after_ts}"
+
+    message_ids: list[str] = []
+    page_token: Optional[str] = None
+
+    log.info("Fetching Gmail history | query='%s' max=%d", query, max_emails)
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        # --- Page through message list (lightweight, only IDs) ---
+        while len(message_ids) < max_emails:
+            params: dict = {
+                "q":          query,
+                "maxResults": min(50, max_emails - len(message_ids)),
+            }
+            if page_token:
+                params["pageToken"] = page_token
+
+            resp = await client.get(
+                f"{GMAIL_API_BASE}/messages",
+                headers=headers,
+                params=params,
+            )
+            if resp.status_code != 200:
+                log.warning("Gmail list failed: %s %s", resp.status_code, resp.text[:200])
+                break
+
+            data = resp.json()
+            for m in data.get("messages", []):
+                message_ids.append(m["id"])
+
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+
+        log.info("Found %d message IDs for email '%s'", len(message_ids), sender_email)
+
+        # --- Fetch each message in full  (truly parallel via asyncio.gather) ---
+        parsed: list[dict] = []
+
+        async def _fetch_one(mid: str) -> Optional[dict]:
+            try:
+                r = await client.get(
+                    f"{GMAIL_API_BASE}/messages/{mid}",
+                    headers=headers,
+                    params={"format": "full"},
+                )
+                if r.status_code != 200:
+                    return None
+                msg     = r.json()
+                payload = msg.get("payload", {})
+                hdrs    = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
+                body    = _extract_body(payload)
+                if not body.strip():
+                    return None
+                return {
+                    "id":      msg["id"],
+                    "subject": hdrs.get("subject", ""),
+                    "from":    hdrs.get("from", ""),
+                    "date":    hdrs.get("date", ""),
+                    "body":    body,
+                }
+            except Exception as e:
+                log.warning("Error fetching message %s: %s", mid, e)
+                return None
+
+        # Batches of 10 in parallel (respects Gmail API rate limits)
+        for batch_start in range(0, len(message_ids), 10):
+            batch   = message_ids[batch_start:batch_start + 10]
+            results = await asyncio.gather(*[_fetch_one(mid) for mid in batch])
+            parsed.extend(r for r in results if r is not None)
+
+    log.info("Parsed %d messages with body for email '%s'", len(parsed), sender_email)
+    return parsed
+
+
+def _extract_body(payload: dict, depth: int = 0) -> str:
+    """Recursively extract plain-text body from a Gmail message payload."""
+    if depth > 5:
+        return ""
+
+    mime      = payload.get("mimeType", "")
+    body_data = payload.get("body", {}).get("data", "")
+
+    if mime == "text/plain" and body_data:
+        try:
+            return base64.urlsafe_b64decode(body_data + "==").decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    for part in payload.get("parts", []):
+        text = _extract_body(part, depth + 1)
+        if text:
+            return text
+
+    return ""
+
+# ---------------------------------------------------------------------------
+# Pinecone upsert helpers
+# ---------------------------------------------------------------------------
+
+def _build_upsert_records(
+    messages:      list[dict],
+    namespace:     str,
+    sender_email:  str,
+    user_id:       str,
+) -> int:
+    """
+    Embed and upsert a list of message dicts into Pinecone.
+    sender_email and user_id stored in metadata for filtered querying.
+    Returns number of vectors upserted.
+    """
+    if not messages:
+        return 0
+
+    valid = [m for m in messages if m.get("body", "").strip()]
+    if not valid:
+        return 0
+
+    texts = [
+        f"Subject: {m.get('subject','')}\nFrom: {m.get('from','')}\n\n{m.get('body','')}"
+        .strip()[:8000]
+        for m in valid
+    ]
+
+    vectors = _embed(texts)
+
+    records = []
+    for msg, vec in zip(valid, vectors):
+        records.append({
+            "id": _vector_id(msg["id"], prefix="msg-"),
+            "values": vec,
+            "metadata": {
+                "user_id":       user_id,
+                "sender_email":  sender_email,
+                "message_id":    msg.get("id", ""),
+                "subject":       msg.get("subject", "")[:256],
+                "sender":        msg.get("from", "")[:256],
+                "date":          msg.get("date", "")[:64],
+                "body_snippet":  msg.get("body", "")[:512],
+                "type":          _classify_type(msg.get("subject", ""), msg.get("body", "")),
+            },
+        })
+
+    # Batch upsert (Pinecone hard limit: 100 vectors per call)
+    batch_size = 100
+    for i in range(0, len(records), batch_size):
+        index.upsert(vectors=records[i:i + batch_size], namespace=namespace)
+
+    log.info(
+        "Upserted %d vectors (user=%s email=%s) into namespace '%s'",
+        len(records), user_id, sender_email, namespace,
+    )
+    return len(records)
+
+
+def _classify_type(subject: str, body: str) -> str:
+    """Lightweight heuristic to tag a message type for metadata filtering."""
+    text = (subject + " " + body).lower()
+    if any(w in text for w in ["unsubscribe", "promotional", "discount", "offer", "deal", "coupon"]):
+        return "marketing"
+    if any(w in text for w in ["invoice", "receipt", "payment", "order", "confirmation", "shipping"]):
+        return "transactional"
+    if any(w in text for w in ["re:", "reply", "thanks", "hi ", "hello", "dear", "please", "following up"]):
+        return "conversational"
+    return "informational"
+
+# ---------------------------------------------------------------------------
+# Context scoring
+# ---------------------------------------------------------------------------
+
+import json
+
+def _generate_llm_context(body_text: str, matches: list[dict], global_matches: list[dict]) -> dict:
+    """Uses gpt-5-nano to generate drafter-focused context for the user."""
+    if not matches and not global_matches:
+        return {
+            "relationship": "No prior relationship history found.",
+            "topic": "No prior topic history found to inform this reply.",
+            "behavioural": "Acknowledge the email professionally and respond to their specific questions."
+        }
+
+    # History from THIS specific sender
+    sender_history = "\n---\n".join([
+        f"Snippet: {m.get('metadata', {}).get('body_snippet', '')[:200]}"
+        for m in matches[:3]
+    ])
+
+    # History across ALL senders (to catch cross-conversations, e.g. talking to a manager)
+    global_history = "\n---\n".join([
+        f"Sender: {m.get('metadata', {}).get('sender', 'Unknown')}\nSnippet: {m.get('metadata', {}).get('body_snippet', '')[:200]}"
+        for m in global_matches[:5]
+    ])
+
+    prompt = f"""
+You are an intelligent email drafting assistant. The user has received a new email.
+Your job is to analyze the new email against two types of retrieved history:
+1. Past emails with THIS specific sender.
+2. Past emails with ANY sender (global history), which might contain critical behind-the-scenes context (e.g. the user told a manager a project is delayed).
+
+New Email:
+{body_text[:800]}
+
+--- Past Emails with THIS Sender ---
+{sender_history if sender_history else "None found."}
+
+--- Relevant Global History (Other Senders) ---
+{global_history if global_history else "None found."}
+
+Provide a very short plain-English summary (1-2 sentences each) for the following three dimensions:
+Output EXACTLY valid JSON with keys: "relationship", "topic", "behavioural".
+
+Dimensions constraints:
+- "relationship": How formal or informal is the user's past interaction with this specific sender? 
+- "topic": What are the background facts based on the global history? For instance, if the new email asks for a deliverable but global history says it is delayed, state that clearly ("You recently informed your manager that the project is not ready...").
+- "behavioural": Explicit drafting advice for how the user should reply right now, considering both the relationship and the factual constraints.
+"""
+    try:
+        resp = openai_client.chat.completions.create(
+            model="gpt-5-nano",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "You are a concise, analytical email drafting assistant. Output only JSON."},
+                {"role": "user", "content": prompt}
+            ],
+           seed=42
+        )
+        return json.loads(resp.choices[0].message.content)
+    except Exception as e:
+        log.error("Failed to generate LLM drafter context: %s", e)
+        return {
+            "relationship": "Error generating relationship context.",
+            "topic": "Error generating topic context.",
+            "behavioural": "Error generating behavioural context."
+        }
+
+
+def _score_relationship(results: list[dict], desc: str) -> tuple[ContextScore, float]:
+    """Relationship score derived from conversational matches."""
+    conversational = [r for r in results if r.get("metadata", {}).get("type") == "conversational"]
+    avg_score = (
+        sum(r["score"] for r in conversational) / len(conversational)
+        if conversational else 0.0
+    )
+
+    return ContextScore(description=desc), round(avg_score, 4)
+
+
+def _score_topic(results: list[dict], desc: str) -> tuple[ContextScore, float]:
+    """Topic score based on raw top-3 cosine matches."""
+    if not results:
+        return ContextScore(description=desc), 0.0
+
+    top_scores = sorted([r["score"] for r in results], reverse=True)
+    avg_top3   = sum(top_scores[:3]) / min(3, len(top_scores))
+
+    return ContextScore(description=desc), round(avg_top3, 4)
+
+
+def _score_behavioural(results: list[dict], desc: str) -> tuple[ContextScore, float]:
+    """Behavioural score based on the dominant predicted sending pattern."""
+    type_counts: dict[str, int]   = {}
+    type_scores: dict[str, float] = {}
+
+    for r in results:
+        t = r.get("metadata", {}).get("type", "informational")
+        type_counts[t] = type_counts.get(t, 0) + 1
+        type_scores[t] = type_scores.get(t, 0.0) + r["score"]
+
+    if not type_counts:
+        return ContextScore(description=desc), 0.0
+
+    dominant_type  = max(type_counts, key=lambda k: type_counts[k])
+    dominant_ratio = type_counts[dominant_type] / len(results)
+    dominant_score = type_scores[dominant_type] / type_counts[dominant_type]
+
+    return ContextScore(description=desc), round(dominant_ratio * dominant_score, 4)
+
+# ---------------------------------------------------------------------------
+# Main endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/context", response_model=ContextResponse, summary="Get email context")
+async def get_context(req: ContextRequest):
+
+    namespace = _user_namespace(req.user_id)
+    log.info(
+        "Context request | user=%s email=%s",
+        req.user_id, req.sender_email,
+    )
+
+    # ── 1. Embed the current body ─────────────────────────────────────────
+    body_text = f"Subject: {req.subject or ''}\n\n{req.body}".strip()[:8000]
+    [body_embedding] = _embed([body_text])
+
+    # ── 5. Query Pinecone – filtered to this user+sender ──────────────────
+    query_result = index.query(
+        vector=body_embedding,
+        top_k=TOP_K,
+        include_metadata=True,
+        namespace=namespace,
+        filter={
+            "user_id":       {"$eq": req.user_id},
+            "sender_email":  {"$eq": req.sender_email},
+        },
+    )
+    matches = query_result.get("matches", [])
+    vectors_upserted = 0
+
+    # ── 5b. Query Pinecone – global history (all senders) ─────────────────
+    global_query_result = index.query(
+        vector=body_embedding,
+        top_k=TOP_K,
+        include_metadata=True,
+        namespace=namespace,
+        filter={
+            "user_id": {"$eq": req.user_id},
+        },
+    )
+    global_matches = global_query_result.get("matches", [])
+
+    # ── 6. Cold Start Check (uses actual Pinecone vector count via matches) ─
+    if not _is_warm(req.user_id, req.sender_email):
+        async with _warm_lock:
+            if not _is_warm(req.user_id, req.sender_email):
+                if len(matches) >= MIN_VECTORS:
+                    log.info("Pinecone already warm for (user=%s, email=%s)", req.user_id, req.sender_email)
+                    _mark_warm(req.user_id, req.sender_email)
+                else:
+                    log.info(
+                        "Cold start for (user=%s, email=%s) — found only %d prior vectors. "
+                        "Fetching last %d days of history …",
+                        req.user_id, req.sender_email, len(matches), HISTORY_DAYS,
+                    )
+                    messages = await _fetch_sender_history(
+                        sender_email=req.sender_email,
+                        token=req.token,
+                    )
+
+                    if messages:
+                        vectors_upserted = _build_upsert_records(
+                            messages=messages,
+                            namespace=namespace,
+                            sender_email=req.sender_email,
+                            user_id=req.user_id,
+                        )
+                        # Re-query Pinecone so the scores include the new history!
+                        query_result = index.query(
+                            vector=body_embedding,
+                            top_k=TOP_K,
+                            include_metadata=True,
+                            namespace=namespace,
+                            filter={
+                                "user_id":       {"$eq": req.user_id},
+                                "sender_email":  {"$eq": req.sender_email},
+                            },
+                        )
+                        matches = query_result.get("matches", [])
+                        
+                        global_query_result = index.query(
+                            vector=body_embedding,
+                            top_k=TOP_K,
+                            include_metadata=True,
+                            namespace=namespace,
+                            filter={"user_id": {"$eq": req.user_id}},
+                        )
+                        global_matches = global_query_result.get("matches", [])
+                    else:
+                        log.warning("No history found for email '%s' in the last %d days.", req.sender_email, HISTORY_DAYS)
+
+                    _mark_warm(req.user_id, req.sender_email)
+
+    log.info("Scoring based on %d sender matches / %d global matches for (user=%s)", len(matches), len(global_matches), req.user_id)
+
+    # ── 7. Build the Drafter Context ─────────────────────────────────────
+    llm_context = _generate_llm_context(body_text, matches, global_matches)
+
+    rel_ctx, rel_score = _score_relationship(matches, desc=llm_context.get("relationship", ""))
+    top_ctx, top_score = _score_topic(matches, desc=llm_context.get("topic", ""))
+    beh_ctx, beh_score = _score_behavioural(matches, desc=llm_context.get("behavioural", ""))
+
+    overall_relevance = round(
+        rel_score * 0.30 + top_score * 0.50 + beh_score * 0.20, 4
+    )
+    is_relevant = overall_relevance >= RELEVANCE_THRESHOLD
+
+    # ── 7. Upsert the current body so future calls benefit from it ────────
+    current_record = {
+        "id": _vector_id(f"{req.user_id}::{req.sender_email}::{req.body[:100]}", prefix="cur-"),
+        "values": body_embedding,
+        "metadata": {
+            "user_id":       req.user_id,
+            "sender_email":  req.sender_email,
+            "message_id":    "",
+            "subject":       (req.subject or "")[:256],
+            "sender":        req.sender_email[:256],
+            "date":          str(int(time.time())),
+            "body_snippet":  req.body[:512],
+            "type":          _classify_type(req.subject or "", req.body),
+            "source":        "current",
+        },
+    }
+    index.upsert(vectors=[current_record], namespace=namespace)
+    vectors_upserted += 1
+
+    log.info(
+        "overall_relevance=%.4f is_relevant=%s (user=%s email=%s)",
+        overall_relevance, is_relevant, req.user_id, req.sender_email,
+    )
+
+    return ContextResponse(
+        relationship_context=rel_ctx,
+        topic_context=top_ctx,
+        behavioural_context=beh_ctx,
+        overall_relevance=overall_relevance,
+        is_relevant=is_relevant,
+        vectors_upserted=vectors_upserted,
+        user_namespace=namespace,
+        sender_email=req.sender_email,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
+@app.get("/health", summary="Health check")
+async def health():
+    return {"status": "ok", "model": EMBED_MODEL, "index": PINECONE_INDEX_NAME}
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
