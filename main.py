@@ -22,9 +22,11 @@ Namespace strategy
 
 import asyncio
 import base64
+import html
 import hashlib
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -136,10 +138,11 @@ app.add_middleware(
 class ContextRequest(BaseModel):
     user_id:       str = Field(..., description="Clerk / internal user ID")
     sender_email:  str = Field(..., description="Full sender email address, e.g. 'john@github.com'")
-    token:         str = Field(..., description="Google OAuth2 access token")
+    token:         str = Field(..., description="Mailbox OAuth2 access token (Gmail or Microsoft Graph)")
     body:          str = Field(..., description="Current email body to analyse")
     subject:       Optional[str] = Field(None, description="Email subject (optional, improves quality)")
     timezone:      str = Field("UTC", description="User timezone, e.g. 'America/New_York'")
+    is_gmail:      bool = Field(True, description="Whether the mailbox token is for Gmail. Defaults to true.")
 
 class ContextScore(BaseModel):
     description: str
@@ -301,6 +304,177 @@ async def _fetch_sender_history(
 
     log.info("Parsed %d messages with body for email '%s'", len(parsed), sender_email)
     return parsed
+
+
+def _strip_html(value: str) -> str:
+    """Best-effort HTML to text conversion for Outlook bodies."""
+    if not value:
+        return ""
+
+    text = re.sub(r"<br\s*/?>", "\n", value, flags=re.IGNORECASE)
+    text = re.sub(r"</p\s*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
+async def _fetch_outlook_messages(
+    *,
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict,
+    params: dict,
+    max_emails: int,
+    date_field: str,
+) -> list[dict]:
+    """Fetch paginated Outlook messages from Microsoft Graph."""
+    collected: list[dict] = []
+    next_url: Optional[str] = url
+    next_params: Optional[dict] = params
+
+    while next_url and len(collected) < max_emails:
+        resp = await client.get(next_url, headers=headers, params=next_params)
+        if resp.status_code != 200:
+            log.warning("Microsoft Graph list failed: %s %s", resp.status_code, resp.text[:200])
+            break
+
+        data = resp.json()
+        for msg in data.get("value", []):
+            body_text = _strip_html(msg.get("body", {}).get("content", "")) or msg.get("bodyPreview", "")
+            if not body_text.strip():
+                continue
+
+            sender = (
+                msg.get("from", {})
+                .get("emailAddress", {})
+                .get("address", "")
+            ) or (
+                msg.get("sender", {})
+                .get("emailAddress", {})
+                .get("address", "")
+            )
+
+            collected.append({
+                "id": msg.get("id", ""),
+                "subject": msg.get("subject", ""),
+                "from": sender,
+                "date": msg.get(date_field, ""),
+                "body": body_text,
+            })
+
+            if len(collected) >= max_emails:
+                break
+
+        next_url = data.get("@odata.nextLink")
+        next_params = None
+
+    return collected
+
+
+async def _fetch_sender_history_outlook(
+    sender_email: str,
+    token: str,
+    days: int = HISTORY_DAYS,
+    max_emails: int = HISTORY_MAX_EMAILS,
+) -> list[dict]:
+    """
+    Fetch up to `max_emails` Outlook messages from the last `days` days involving
+    `sender_email` using Microsoft Graph.
+
+    We fetch both inbound mail and sent mail so behaviour matches the Gmail path.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff_iso = cutoff.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Prefer": 'outlook.body-content-type="text"',
+    }
+
+    inbound_params = {
+        "$top": min(25, max_emails),
+        "$select": "id,subject,from,sender,body,bodyPreview,receivedDateTime",
+        "$filter": (
+            f"receivedDateTime ge {cutoff_iso} and "
+            f"(from/emailAddress/address eq '{sender_email}' or sender/emailAddress/address eq '{sender_email}')"
+        ),
+    }
+
+    outbound_params = {
+        "$top": min(25, max_emails),
+        "$select": "id,subject,from,sender,body,bodyPreview,sentDateTime,toRecipients,ccRecipients,bccRecipients",
+        "$filter": (
+            f"sentDateTime ge {cutoff_iso} and ("
+            f"toRecipients/any(r:r/emailAddress/address eq '{sender_email}') or "
+            f"ccRecipients/any(r:r/emailAddress/address eq '{sender_email}') or "
+            f"bccRecipients/any(r:r/emailAddress/address eq '{sender_email}')"
+            f")"
+        ),
+    }
+
+    log.info("Fetching Outlook history | sender='%s' max=%d", sender_email, max_emails)
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        inbound, outbound = await asyncio.gather(
+            _fetch_outlook_messages(
+                client=client,
+                url="https://graph.microsoft.com/v1.0/me/messages",
+                headers=headers,
+                params=inbound_params,
+                max_emails=max_emails,
+                date_field="receivedDateTime",
+            ),
+            _fetch_outlook_messages(
+                client=client,
+                url="https://graph.microsoft.com/v1.0/me/mailFolders/SentItems/messages",
+                headers=headers,
+                params=outbound_params,
+                max_emails=max_emails,
+                date_field="sentDateTime",
+            ),
+        )
+
+    combined: dict[str, dict] = {}
+    for msg in inbound + outbound:
+        if msg.get("id"):
+            combined[msg["id"]] = msg
+
+    parsed = sorted(
+        combined.values(),
+        key=lambda m: m.get("date", ""),
+        reverse=True,
+    )[:max_emails]
+
+    log.info("Parsed %d Outlook messages with body for email '%s'", len(parsed), sender_email)
+    return parsed
+
+
+async def _fetch_sender_history_for_provider(
+    *,
+    sender_email: str,
+    token: str,
+    is_gmail: bool,
+    days: int = HISTORY_DAYS,
+    max_emails: int = HISTORY_MAX_EMAILS,
+) -> list[dict]:
+    """Fetch sender history from Gmail or Outlook based on the request."""
+    if is_gmail:
+        return await _fetch_sender_history(
+            sender_email=sender_email,
+            token=token,
+            days=days,
+            max_emails=max_emails,
+        )
+
+    return await _fetch_sender_history_outlook(
+        sender_email=sender_email,
+        token=token,
+        days=days,
+        max_emails=max_emails,
+    )
 
 
 def _extract_body(payload: dict, depth: int = 0) -> str:
@@ -580,10 +754,13 @@ async def get_context(req: ContextRequest):
                         "Fetching last %d days of history …",
                         req.user_id, req.sender_email, len(matches), HISTORY_DAYS,
                     )
-                    messages = await _fetch_sender_history(
+                    messages = await _fetch_sender_history_for_provider(
                         sender_email=req.sender_email,
                         token=req.token,
+                        is_gmail=req.is_gmail,
                     )
+
+                    print(messages[0])
 
                     if messages:
                         vectors_upserted = _build_upsert_records(
