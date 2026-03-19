@@ -141,7 +141,7 @@ class ContextRequest(BaseModel):
     token:         str = Field(..., description="Mailbox OAuth2 access token (Gmail or Microsoft Graph)")
     body:          str = Field(..., description="Current email body to analyse")
     subject:       Optional[str] = Field(None, description="Email subject (optional, improves quality)")
-    timezone:      str = Field("UTC", description="User timezone, e.g. 'America/New_York'")
+    timezone:      str = Field(..., description="User timezone, e.g. 'America/New_York'")
     is_gmail:      bool = Field(True, description="Whether the mailbox token is for Gmail. Defaults to true.")
 
 class ContextScore(BaseModel):
@@ -704,6 +704,8 @@ def _score_behavioural(results: list[dict], desc: str) -> tuple[ContextScore, fl
 
 @app.post("/context", response_model=ContextResponse, summary="Get email context")
 async def get_context(req: ContextRequest):
+
+    print(req)
 
     namespace = _user_namespace(req.user_id)
     log.info(
