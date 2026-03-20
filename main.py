@@ -700,8 +700,7 @@ def _score_behavioural(results: list[dict], desc: str) -> tuple[ContextScore, fl
 @app.post("/context", response_model=ContextResponse, summary="Get email context")
 async def get_context(req: ContextRequest):
 
-    print(req)
-
+    
     namespace = _user_namespace(req.user_id)
     log.info(
         "Context request | user=%s email=%s",
@@ -757,7 +756,7 @@ async def get_context(req: ContextRequest):
                         is_gmail=req.is_gmail,
                     )
 
-                    print(messages[0])
+                  
 
                     if messages:
                         vectors_upserted = _build_upsert_records(
