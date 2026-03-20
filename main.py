@@ -30,7 +30,6 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -576,15 +575,9 @@ import json
 
 def _generate_llm_context(body_text: str, subject: str, matches: list[dict], global_matches: list[dict], timezone_str: str) -> dict:
     """Uses gpt-5-nano to generate drafter-focused context and extract entities for the user."""
-    
-    try:
-        local_time = datetime.now(ZoneInfo(timezone_str))
-    except Exception:
-        local_time = datetime.now(timezone.utc)
-        timezone_str = "UTC"
-        
-    today_str = local_time.strftime("%Y-%m-%d")
-    day_of_week_str = local_time.strftime("%A")
+
+    utc_now = datetime.now(timezone.utc)
+    utc_today_str = utc_now.strftime("%Y-%m-%d")
 
     # History from THIS specific sender
     sender_history = "\n---\n".join([
@@ -605,7 +598,8 @@ Your job is to analyze the new email against two types of retrieved history (if 
 2. Past emails with ANY sender (global history), which might contain critical behind-the-scenes context (e.g. the user told a manager a project is delayed).
 Additionally, extract structured information from the new email.
 
-Today is {today_str} ({day_of_week_str}), timezone {timezone_str}.
+User timezone is {timezone_str}.
+Current UTC date is {utc_today_str}.
 
 New Email Subject: {subject}
 New Email Body:
@@ -630,9 +624,10 @@ Dimensions constraints:
 
 IMPORTANT for dates:
 All ISO dates must include the timezone offset for {timezone_str}. Never use bare local time without an offset.
-If someone says "this Friday" and today IS Friday, "this Friday" means TODAY ({today_str}), not next week.
+First infer the current local date in {timezone_str} from the UTC date {utc_today_str}, then resolve relative dates from that local date.
+If someone says "this Friday" and today IS Friday, "this Friday" means TODAY, not next week.
 If someone says "next Friday", that means the Friday of next week.
-Resolve all relative dates from today's date {today_str}.
+Resolve all relative dates in {timezone_str}.
 """
     try:
         resp = openai_client.chat.completions.create(
