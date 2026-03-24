@@ -574,7 +574,7 @@ def _classify_type(subject: str, body: str) -> str:
 import json
 
 def _generate_llm_context(body_text: str, subject: str, matches: list[dict], global_matches: list[dict], timezone_str: str) -> dict:
-    """Uses gpt-5-nano to generate drafter-focused context and extract entities for the user."""
+    """Uses gpt-5-mini to generate drafter-focused context and extract entities for the user."""
 
     utc_now = datetime.now(timezone.utc)
     utc_today_str = utc_now.strftime("%Y-%m-%d")
@@ -631,7 +631,7 @@ Resolve all relative dates in {timezone_str}.
 """
     try:
         resp = openai_client.chat.completions.create(
-            model="gpt-5-nano",
+            model="gpt-5-mini",
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": "You are a concise, analytical email drafting assistant. Output only JSON."},
