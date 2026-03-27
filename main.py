@@ -591,50 +591,42 @@ def _generate_llm_context(body_text: str, subject: str, matches: list[dict], glo
         for m in (global_matches[:5] if global_matches else [])
     ])
 
-    prompt = f"""
-You are an intelligent email drafting assistant. The user has received a new email.
-Your job is to analyze the new email against two types of retrieved history (if any):
-1. Past emails with THIS specific sender.
-2. Past emails with ANY sender (global history), which might contain critical behind-the-scenes context (e.g. the user told a manager a project is delayed).
-Additionally, extract structured information from the new email.
+    system_msg = (
+        "You are an email context analyst. Output only valid JSON. "
+        "STRICT RULES — violating any is an error:\n"
+        "1. Only use information explicitly present in the provided email body or retrieved history snippets. "
+        "Never infer, assume, or add facts from outside the given text.\n"
+        "2. If a history section is empty ('None found'), use the exact fallback string specified for that field. "
+        "Do NOT substitute with advice or guesses.\n"
+        "3. For mentionedDates: extract only dates written in the email body; never fabricate. "
+        "Resolve relative dates using the current local date in the user's timezone."
+    )
 
-User timezone is {timezone_str}.
-Current UTC date is {utc_today_str}.
+    prompt = f"""Timezone: {timezone_str} | UTC date: {utc_today_str}
 
-New Email Subject: {subject}
-New Email Body:
+Subject: {subject}
+Email body:
 {body_text[:800]}
 
---- Past Emails with THIS Sender ---
+Sender history (retrieved):
 {sender_history if sender_history else "None found."}
 
---- Relevant Global History (Other Senders) ---
+Global history (retrieved):
 {global_history if global_history else "None found."}
 
-Provide a very short plain-English summary (1-2 sentences each) for the relationship, topic, and behavioural dimensions.
-Output EXACTLY valid JSON with these keys: "relationship", "topic", "behavioural", "intent", "keywords", "mentionedDates".
-
-Dimensions constraints:
-- "relationship": How formal or informal is the user's past interaction with this specific sender? (Say "No prior relationship history found" if none)
-- "topic": What are the background facts based on the global history? For instance, if the new email asks for a deliverable but global history says it is delayed, state that clearly. (Say "No prior topic history found" if none)
-- "behavioural": Explicit drafting advice for how the user should reply right now, considering both the relationship and the factual constraints. (If no history, give general professional advice based on the email content)
-- "intent": "scheduling_request|task_assignment|question|follow_up|general"
-- "keywords": ["max 3 topic keywords based on the new email"]
-- "mentionedDates": [{{"raw": "Wednesday at 5pm", "iso": "2026-03-18T17:00:00+05:30"}}]
-
-IMPORTANT for dates:
-All ISO dates must include the timezone offset for {timezone_str}. Never use bare local time without an offset.
-First infer the current local date in {timezone_str} from the UTC date {utc_today_str}, then resolve relative dates from that local date.
-If someone says "this Friday" and today IS Friday, "this Friday" means TODAY, not next week.
-If someone says "next Friday", that means the Friday of next week.
-Resolve all relative dates in {timezone_str}.
-"""
+Return JSON with exactly these keys and rules:
+- relationship: 1-2 sentences from sender history only. Fallback: "No prior relationship history found."
+- topic: 1-2 sentences of facts from global history relevant to this email. Fallback: "No prior topic history found."
+- behavioural: 1-2 sentences of reply guidance based only on relationship+topic above. Fallback if both empty: "Insufficient history to provide behavioural guidance."
+- intent: one of [scheduling_request, task_assignment, question, follow_up, general] — from email body only.
+- keywords: up to 3 keywords from email body. [] if none.
+- mentionedDates: [{{"raw": "<exact text>", "iso": "<ISO-8601 with {timezone_str} offset>"}}] for each date in the body. [] if none."""
     try:
         resp = openai_client.chat.completions.create(
             model="gpt-5-mini",
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": "You are a concise, analytical email drafting assistant. Output only JSON."},
+                {"role": "system", "content": system_msg},
                 {"role": "user", "content": prompt}
             ],
            seed=42
