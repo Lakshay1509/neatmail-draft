@@ -574,7 +574,12 @@ def _apply_recency_decay(matches: list[dict]) -> list[dict]:
     weighted_matches: list[dict] = []
 
     for match in matches:
-        cloned = dict(match)
+        if hasattr(match, "to_dict"):
+            cloned = match.to_dict()
+        elif hasattr(match, "dict") and callable(match.dict):
+            cloned = match.dict()
+        else:
+            cloned = dict(match)
         metadata = cloned.get("metadata") or {}
         msg_dt = _parse_message_datetime(str(metadata.get("date", "")))
         weight = _recency_weight(msg_dt, now_utc)
