@@ -22,6 +22,7 @@ Namespace strategy
 
 import asyncio
 import base64
+from email.utils import parsedate_to_datetime
 import html
 import hashlib
 import logging
@@ -497,6 +498,95 @@ def _extract_body(payload: dict, depth: int = 0) -> str:
 
     return ""
 
+
+def _parse_message_datetime(value: str) -> Optional[datetime]:
+    """Parse various stored message date formats into UTC datetime."""
+    if not value:
+        return None
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    # Epoch timestamp (seconds)
+    if raw.isdigit():
+        try:
+            return datetime.fromtimestamp(int(raw), tz=timezone.utc)
+        except Exception:
+            pass
+
+    # ISO datetime (Graph) with optional trailing Z
+    iso_candidate = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(iso_candidate)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        pass
+
+    # RFC2822-style datetime (Gmail Date header)
+    try:
+        parsed = parsedate_to_datetime(raw)
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _recency_weight(message_dt: Optional[datetime], now_utc: datetime) -> float:
+    """
+    Explicit TTL decay buckets for historical context.
+      0-3 days   -> 1.0
+      4-6 days   -> 0.8
+      7-15 days  -> 0.6
+      16-30 days -> 0.4
+      31-60 days -> 0.25
+      60+ days   -> 0.1
+    """
+    if message_dt is None:
+        return 0.25
+
+    age_days = max((now_utc - message_dt).total_seconds() / 86400.0, 0.0)
+
+    if age_days <= 3:
+        return 1.0
+    if age_days <= 6:
+        return 0.8
+    if age_days <= 15:
+        return 0.6
+    if age_days <= 30:
+        return 0.4
+    if age_days <= 60:
+        return 0.25
+    return 0.1
+
+
+def _apply_recency_decay(matches: list[dict]) -> list[dict]:
+    """Apply explicit recency decay to Pinecone match scores."""
+    if not matches:
+        return []
+
+    now_utc = datetime.now(timezone.utc)
+    weighted_matches: list[dict] = []
+
+    for match in matches:
+        cloned = dict(match)
+        metadata = cloned.get("metadata") or {}
+        msg_dt = _parse_message_datetime(str(metadata.get("date", "")))
+        weight = _recency_weight(msg_dt, now_utc)
+        raw_score = float(cloned.get("score", 0.0))
+
+        cloned["raw_score"] = raw_score
+        cloned["time_weight"] = weight
+        cloned["score"] = raw_score * weight
+        weighted_matches.append(cloned)
+
+    return weighted_matches
+
 # ---------------------------------------------------------------------------
 # Pinecone upsert helpers
 # ---------------------------------------------------------------------------
@@ -715,6 +805,7 @@ async def get_context(req: ContextRequest):
         },
     )
     matches = query_result.get("matches", [])
+    matches = _apply_recency_decay(matches)
     vectors_upserted = 0
 
     # ── 5b. Query Pinecone – global history (all senders) ─────────────────
@@ -728,6 +819,7 @@ async def get_context(req: ContextRequest):
         },
     )
     global_matches = global_query_result.get("matches", [])
+    global_matches = _apply_recency_decay(global_matches)
 
     # ── 6. Cold Start Check (uses actual Pinecone vector count via matches) ─
     if not _is_warm(req.user_id, req.sender_email):
@@ -769,6 +861,7 @@ async def get_context(req: ContextRequest):
                             },
                         )
                         matches = query_result.get("matches", [])
+                        matches = _apply_recency_decay(matches)
                         
                         global_query_result = index.query(
                             vector=body_embedding,
@@ -778,6 +871,7 @@ async def get_context(req: ContextRequest):
                             filter={"user_id": {"$eq": req.user_id}},
                         )
                         global_matches = global_query_result.get("matches", [])
+                        global_matches = _apply_recency_decay(global_matches)
                     else:
                         log.warning("No history found for email '%s' in the last %d days.", req.sender_email, HISTORY_DAYS)
 
